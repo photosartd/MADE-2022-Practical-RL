@@ -14,18 +14,20 @@ ENV_NAME = "Walker2DBulletEnv-v0"
 LAMBDA = 0.95
 GAMMA = 0.99
 
-ACTOR_LR = 2e-4
-CRITIC_LR = 1e-4
+ACTOR_LR = 5e-4
+CRITIC_LR = 2e-4
 
 CLIP = 0.2
 ENTROPY_COEF = 1e-2
 BATCHES_PER_UPDATE = 64
-BATCH_SIZE = 64
+BATCH_SIZE = 1024
 
 MIN_TRANSITIONS_PER_UPDATE = 2048
 MIN_EPISODES_PER_UPDATE = 4
 
-ITERATIONS = 1000
+ITERATIONS = 3000
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
     
 def compute_lambda_returns_and_gae(trajectory):
@@ -50,17 +52,34 @@ class Actor(nn.Module):
         super().__init__()
         # Advice: use same log_sigma for all states to improve stability
         # You can do this by defining log_sigma as nn.Parameter(torch.zeros(...))
-        self.model = None
-        self.sigma = None
+        hid_dim = state_dim // 2
+        self.model = nn.Sequential(
+            nn.Linear(state_dim, hid_dim),
+            nn.ReLU(),
+            nn.Linear(hid_dim, hid_dim),
+            nn.ReLU(),
+            nn.Linear(hid_dim, action_dim)
+        )
+        self.sigma = nn.Parameter(torch.ones(action_dim))
         
     def compute_proba(self, state, action):
         # Returns probability of action according to current policy and distribution of actions
-        return None
+        distrib = self.get_action_distribution(state)
+        return torch.exp(distrib.log_prob(action).sum(-1))
         
     def act(self, state):
+        distrib = self.get_action_distribution(state)
+        pure_action = distrib.sample()
+        action = torch.tanh(pure_action)
         # Returns an action (with tanh), not-transformed action (without tanh) and distribution of non-transformed actions
         # Remember: agent is not deterministic, sample actions from distribution (e.g. Gaussian)
-        return None
+        return action, pure_action, distrib
+
+    def get_action_distribution(self, state):
+        mu = self.model(state)
+        #batch_size x action_dim
+        distrib = Normal(mu, self.sigma)
+        return distrib
         
         
 class Critic(nn.Module):
@@ -80,13 +99,13 @@ class Critic(nn.Module):
 
 class PPO:
     def __init__(self, state_dim, action_dim):
-        self.actor = Actor(state_dim, action_dim)
-        self.critic = Critic(state_dim)
+        self.actor = Actor(state_dim, action_dim).to(device)
+        self.critic = Critic(state_dim).to(device)
         self.actor_optim = Adam(self.actor.parameters(), ACTOR_LR)
         self.critic_optim = Adam(self.critic.parameters(), CRITIC_LR)
 
     def update(self, trajectories):
-        transitions = [t for traj in trajectories for t in traj] # Turn a list of trajectories into list of transitions
+        transitions = [t for traj in trajectories for t in traj] # Turn a list of trajectories into list of transitions (s, a, p, v, adv)
         state, action, old_prob, target_value, advantage = zip(*transitions)
         state = np.array(state)
         action = np.array(action)
@@ -98,34 +117,57 @@ class PPO:
         
         for _ in range(BATCHES_PER_UPDATE):
             idx = np.random.randint(0, len(transitions), BATCH_SIZE) # Choose random batch
-            s = torch.tensor(state[idx]).float()
-            a = torch.tensor(action[idx]).float()
-            op = torch.tensor(old_prob[idx]).float() # Probability of the action in state s.t. old policy
-            v = torch.tensor(target_value[idx]).float() # Estimated by lambda-returns 
-            adv = torch.tensor(advantage[idx]).float() # Estimated by generalized advantage estimation 
+            s = torch.tensor(state[idx]).float().to(device)
+            a = torch.tensor(action[idx]).float().to(device)
+            op = torch.tensor(old_prob[idx]).float().to(device) # Probability of the action in state s.t. old policy
+            v = torch.tensor(target_value[idx]).float().to(device).unsqueeze(-1) # Estimated by lambda-returns 
+            adv = torch.tensor(advantage[idx]).float().to(device) # Estimated by generalized advantage estimation 
             
-            # TODO: Update actor here            
-            # TODO: Update critic here
+            new_p = self.actor.compute_proba(s, a)
+            new_v = self.critic.get_value(s)
+
+            critic_loss = F.mse_loss(new_v, v)
+            #print(critic_loss.shape)
+            #print(critic_loss)
+            ratios = new_p / op
+            h1 = ratios * adv
+            h2 = torch.clamp(ratios, 1 - CLIP, 1 + CLIP) * adv
+            actor_loss = - torch.min(h1, h2).mean()
+            #print(actor_loss.shape)
+            #print(actor_loss)
+            #entropy_loss = - self.actor.get_action_distribution(s).entropy().mean()
+            #print(entropy_loss.shape)
+            #print(entropy_loss)
+
+            loss = actor_loss + critic_loss
+            #print(loss.shape)
+            self.actor_optim.zero_grad()
+            self.critic_optim.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.1)
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.1)
+            self.actor_optim.step()
+            self.critic_optim.step()
             
             
     def get_value(self, state):
         with torch.no_grad():
-            state = torch.tensor(np.array([state])).float()
+            state = torch.tensor(np.array([state])).float().to(device)
             value = self.critic.get_value(state)
         return value.cpu().item()
 
     def act(self, state):
         with torch.no_grad():
-            state = torch.tensor(np.array([state])).float()
+            state = torch.tensor(np.array([state])).float().to(device)
             action, pure_action, distr = self.actor.act(state)
             prob = torch.exp(distr.log_prob(pure_action).sum(-1))
         return action.cpu().numpy()[0], pure_action.cpu().numpy()[0], prob.cpu().item()
 
     def save(self):
-        torch.save(self.actor, "agent.pkl")
+        torch.save(self.actor.state_dict(), "agent.pt")
 
 
-def evaluate_policy(env, agent, episodes=5):
+def evaluate_policy(env, agent, episodes=10):
     returns = []
     for _ in range(episodes):
         done = False
@@ -157,6 +199,7 @@ if __name__ == "__main__":
     state = env.reset()
     episodes_sampled = 0
     steps_sampled = 0
+    best_mean_reward = 0
     
     for i in range(ITERATIONS):
         trajectories = []
@@ -171,7 +214,10 @@ if __name__ == "__main__":
 
         ppo.update(trajectories)        
         
-        if (i + 1) % (ITERATIONS//100) == 0:
+        if (i + 1) % (ITERATIONS//300) == 0:
             rewards = evaluate_policy(env, ppo, 5)
-            print(f"Step: {i+1}, Reward mean: {np.mean(rewards)}, Reward std: {np.std(rewards)}, Episodes: {episodes_sampled}, Steps: {steps_sampled}")
-            ppo.save()
+            curr_mean_reward = np.mean(rewards)
+            print(f"Step: {i+1}, Reward mean: {curr_mean_reward}, Reward std: {np.std(rewards)}, Episodes: {episodes_sampled}, Steps: {steps_sampled}")
+            if curr_mean_reward > best_mean_reward:
+                best_mean_reward = curr_mean_reward
+                ppo.save()
