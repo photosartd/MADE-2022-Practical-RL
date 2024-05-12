@@ -10,11 +10,13 @@ import random
 import copy
 
 GAMMA = 0.99
-TAU = 0.002
-CRITIC_LR = 5e-4
-ACTOR_LR = 2e-4
-DEVICE = "cuda"
-BATCH_SIZE = 128
+TAU = 0.005
+CRITIC_LR = 3e-4
+ACTOR_LR = 3e-4
+NOISE = 0.2
+NOISE_CLIP = 0.5
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE = 256
 ENV_NAME = "AntBulletEnv-v0"
 TRANSITIONS = 1000000
 
@@ -55,6 +57,8 @@ class Critic(nn.Module):
 
 class TD3:
     def __init__(self, state_dim, action_dim):
+        self.step = 0
+        self.action_dim = action_dim
         self.actor = Actor(state_dim, action_dim).to(DEVICE)
         self.critic_1 = Critic(state_dim, action_dim).to(DEVICE)
         self.critic_2 = Critic(state_dim, action_dim).to(DEVICE)
@@ -83,12 +87,40 @@ class TD3:
             done = torch.tensor(np.array(done), device=DEVICE, dtype=torch.float)
             
             # Update critic
+            with torch.no_grad():
+                noise = (
+                    torch.randn_like(action) * NOISE
+                ).clamp(-NOISE_CLIP, NOISE_CLIP)
+                
+                next_action = (self.target_actor(next_state) + noise).clamp(-1, 1)
+
+                q_target_1 = self.target_critic_1(next_state, next_action)
+                q_target_2 = self.target_critic_2(next_state, next_action)
+                q_target = torch.min(q_target_1, q_target_2)
+                q_target = reward + (1 - done) * GAMMA * q_target
+            # Get current Q estimates
+            q_curr_1 = self.critic_1(state, action)
+            q_curr_2 = self.critic_2(state, action)
+
+            # Compute critic loss
+            critic_loss = F.mse_loss(q_curr_1, q_target) + F.mse_loss(q_curr_2, q_target)
+            self.critic_1_optim.zero_grad()
+            self.critic_2_optim.zero_grad()
+            critic_loss.backward()
+            self.critic_1_optim.step()
+            self.critic_2_optim.step()
             
-            # Update actor
-            
-            soft_update(self.target_critic_1, self.critic_1)
-            soft_update(self.target_critic_2, self.critic_2)
-            soft_update(self.target_actor, self.actor)
+            if self.step % 2 == 0:
+                # Update actor
+                actor_loss = -self.critic_1(state, self.actor(state)).mean()
+                self.actor_optim.zero_grad()
+                actor_loss.backward()
+                self.actor_optim.step()
+                
+                soft_update(self.target_critic_1, self.critic_1)
+                soft_update(self.target_critic_2, self.critic_2)
+                soft_update(self.target_actor, self.actor)
+            self.step += 1
 
     def act(self, state):
         with torch.no_grad():
@@ -96,7 +128,7 @@ class TD3:
             return self.actor(state).cpu().numpy()[0]
 
     def save(self):
-        torch.save(self.actor, "agent.pkl")
+        torch.save(self.actor.state_dict(), "agent.pt")
 
 
 def evaluate_policy(env, agent, episodes=5):
