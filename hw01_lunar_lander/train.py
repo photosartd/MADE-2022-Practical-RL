@@ -15,38 +15,95 @@ STEPS_PER_UPDATE = 4
 STEPS_PER_TARGET_UPDATE = STEPS_PER_UPDATE * 1000
 BATCH_SIZE = 128
 LEARNING_RATE = 5e-4
+SEED = 42
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+class QModel(nn.Module):
+    def __init__(self, observation_space, action_space, hidden_space=64, seed=SEED):
+        super(QModel, self).__init__()
+        
+        self.seed = torch.manual_seed(seed)
+        self.observation_space = observation_space
+        self.action_space = action_space
+        self.hidden_space = hidden_space
+        
+        self.linear1 = nn.Linear(observation_space, hidden_space)
+        self.linear2 = nn.Linear(hidden_space, hidden_space)
+        self.linear3 = nn.Linear(hidden_space, action_space)
+        
+    def forward(self, state):
+        res = F.relu(self.linear1(state))
+        res = F.relu(self.linear2(res))
+        return self.linear3(res)
+    
+class ReplayBuffer:
+    def __init__(self, maxlen=10000, seed=SEED):
+        
+        self.buffer = deque(maxlen=maxlen)
+        self.Transition = namedtuple("Transition", field_names=["state", "action", "next_state", "reward", "done"])
+        self.seed = random.seed(seed)
+        
+    def add(self, transition):
+        transition = self.Transition(*transition)
+        self.buffer.append(transition)
+        
+    def sample(self, batch_size=512):
+        transitions = random.sample(self.buffer, k=batch_size)
+        
+        #size of all: [batch_size, 1]
+        states = torch.from_numpy(np.vstack([t.state for t in transitions if t is not None])).float().to(device)
+        actions = torch.from_numpy(np.vstack([t.action for t in transitions if t is not None])).long().to(device)
+        next_states = torch.from_numpy(np.vstack([t.next_state for t in transitions if t is not None])).float().to(device)
+        rewards = torch.from_numpy(np.vstack([t.reward for t in transitions if t is not None])).float().to(device)
+        dones = torch.from_numpy(np.vstack([t.done for t in transitions if t is not None]).astype(np.uint8)).float().to(device)
+  
+        return (states, actions, next_states, rewards, dones)
+    
+    def __len__(self):
+        return len(self.buffer)
+    
 class DQN:
     def __init__(self, state_dim, action_dim):
         self.steps = 0 # Do not change
-        self.model = None # Torch model
+        
+        self.model = QModel(state_dim, action_dim).to(device)
+        self.target_model = QModel(state_dim, action_dim).to(device)
+        self.optimizer = Adam(self.model.parameters())
+        self.buffer = ReplayBuffer()
 
     def consume_transition(self, transition):
-        # Add transition to a replay buffer.
-        # Hint: use deque with specified maxlen. It will remove old experience automatically.
-        pass
-
+        self.buffer.add(transition)
+        
     def sample_batch(self):
-        # Sample batch from a replay buffer.
-        # Hints:
-        # 1. Use random.randint
-        # 2. Turn your batch into a numpy.array before turning it to a Tensor. It will work faster
-        pass
+        return self.buffer.sample()
         
     def train_step(self, batch):
-        # Use batch to update DQN's network.
-        pass
+        states, actions, next_states, rewards, dones = batch
+        
+        q_next = self.target_model(next_states).detach().max(1)[0].unsqueeze(1)
+        q_target = rewards + GAMMA * q_next * (1 - dones)
+        q_pred = self.model(states).gather(1, actions)
+        
+        self.optimizer.zero_grad()
+        loss = F.mse_loss(q_pred, q_target)
+        loss.backward()
+        self.optimizer.step()
         
     def update_target_network(self):
-        # Update weights of a target Q-network here. You may use copy.deepcopy to do this or 
-        # assign a values of network parameters via PyTorch methods.
-        pass
+        for target_param, local_param in zip(self.target_model.parameters(), self.model.parameters()):
+            target_param.data.copy_(local_param.data)
 
     def act(self, state, target=False):
         # Compute an action. Do not forget to turn state to a Tensor and then turn an action to a numpy array.
-        state = np.array(state)
-        return 0
+        state = torch.from_numpy(state).float().unsqueeze(0).to(device)
+        
+        self.model.eval()
+        with torch.no_grad():
+            action = np.argmax(self.model(state).cpu().data.numpy())
+        self.model.train()
+
+        return action
 
     def update(self, transition):
         # You don't need to change this
@@ -59,7 +116,7 @@ class DQN:
         self.steps += 1
 
     def save(self):
-        torch.save(self.model, "agent.pkl")
+        torch.save(self.model.state_dict(), "agent.pt")
 
 
 def evaluate_policy(agent, episodes=5):
@@ -81,16 +138,16 @@ if __name__ == "__main__":
     dqn = DQN(state_dim=env.observation_space.shape[0], action_dim=env.action_space.n)
     eps = 0.1
     state = env.reset()
-    
+
     for _ in range(INITIAL_STEPS):
         action = env.action_space.sample()
 
         next_state, reward, done, _ = env.step(action)
         dqn.consume_transition((state, action, next_state, reward, done))
-        
+
         state = next_state if not done else env.reset()
-        
-    
+
+    best_mean_reward = -1000
     for i in range(TRANSITIONS):
         #Epsilon-greedy policy
         if random.random() < eps:
@@ -100,10 +157,12 @@ if __name__ == "__main__":
 
         next_state, reward, done, _ = env.step(action)
         dqn.update((state, action, next_state, reward, done))
-        
+
         state = next_state if not done else env.reset()
-        
+
         if (i + 1) % (TRANSITIONS//100) == 0:
             rewards = evaluate_policy(dqn, 5)
-            print(f"Step: {i+1}, Reward mean: {np.mean(rewards)}, Reward std: {np.std(rewards)}")
-            dqn.save()
+            mean_reward = np.mean(rewards)
+            print(f"Step: {i+1}, Reward mean: {mean_reward}, Reward std: {np.std(rewards)}")
+            if mean_reward > best_mean_reward:
+                dqn.save()
